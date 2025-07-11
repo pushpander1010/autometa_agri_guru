@@ -206,7 +206,8 @@ graph.add_conditional_edges("query_response", needs_pure_llm, {
 })
 
 # Mark both as possible finish points
-graph.set_finish_point(["pure_llm_answer", "__end__"])
+graph.set_finish_point(["pure_llm_answer", "query_response"])
+
 
 # Compile with safe recursion
 agri_agent = graph.compile()
