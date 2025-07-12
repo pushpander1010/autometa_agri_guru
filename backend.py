@@ -4,6 +4,8 @@ from langchain_core.documents import Document
 from langchain.chains import RetrievalQA
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
 from langchain_community.vectorstores import FAISS
 from tools import (
     get_state_coordinates,
@@ -14,12 +16,32 @@ from tools import (
 )
 import os
 
+class CropListOutput(BaseModel):
+    crops: list[str] = Field(description="List of crop names mentioned in the crop plan.")
+
+
+
 # === Supported LLMs ===
 GROQ_MODELS = [
-    "meta-llama/llama-3-8b-instruct",
-    "meta-llama/llama-3-70b-instruct",
-    "meta-llama/llama-4-scout-17b-16e-instruct"
+    "allam-2-7b",
+    "compound-beta",
+    "compound-beta-mini",
+    "deepseek-r1-distill-llama-70b",
+    "gemma2-9b-it",
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-guard-4-12b",
+    "meta-llama/llama-prompt-guard-2-22m",
+    "meta-llama/llama-prompt-guard-2-86m",
+    "mistral-saba-24b",
+    "qwen-qwq-32b",
+    "qwen/qwen3-32b"
 ]
+
 
 # === Embeddings ===
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -70,8 +92,24 @@ def generate_crop_plan(llm, location: dict) -> dict:
     seasonal_weather = get_seasonal_weather_data.invoke({"latitude": lat, "longitude": lon})
 
     # 3. Fetch mandi prices for popular crops
+    parser = PydanticOutputParser(pydantic_object=CropListOutput)
+
+    crop_extraction_prompt = f"""
+Here is a crop plan:
+
+{crop_plan}
+
+Extract only the names of the crops mentioned in this plan. 
+Return them as a list of strings in the format: {{ "crops": ["Wheat", "Rice", "Mustard"] }}
+"""
+
+# Pass prompt through parser
+    parsed_output = parser.invoke(llm.invoke(crop_extraction_prompt).content)
+
+    crop_list = parsed_output.crops if parsed_output and parsed_output.crops else ["Wheat", "Rice", "Mustard"]
+
     mandi_data = []
-    for crop in ["Wheat", "Rice", "Mustard"]:
+    for crop in crop_list:
         prices = get_farm_prices.invoke({"stateName": region, "commodity": crop})
         if "No mandi price" not in prices:
             mandi_data.append(prices)
@@ -93,12 +131,13 @@ Now generate:
 - Fertilizer types & usage
 - Growing instructions
 - Subsidies
-- Image URLs
+- public Image URLs
 """).content
 
     # 5. RAG docs
     docs = [
         Document(page_content=crop_plan, metadata={"type": "plan"}),
+        Document(page_content=soil_info_llm, metadata={"type": "info"}),
         Document(page_content=crop_info, metadata={"type": "info"}),
         Document(page_content=weather_and_soil, metadata={"type": "summary"}),
         Document(page_content=mandi_summary, metadata={"type": "prices"})

@@ -20,16 +20,15 @@ INDIAN_STATES = [
     "Delhi", "Jammu and Kashmir", "Ladakh"
 ]
 
-# === Utility ===
-def extract_image_urls(text):
-    return re.findall(r'(https?://[^\s]+(?:\.png|\.jpg|\.jpeg|\.webp))', text)
-
 # === Session State ===
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 if "curr_loc" not in st.session_state:
     st.session_state.curr_loc = None
+
+if "crop_plan_ready" not in st.session_state:
+    st.session_state.crop_plan_ready = False
 
 # === UI Header ===
 st.title("🌾 AgriGuru: Your AI Farming Assistant")
@@ -39,7 +38,11 @@ st.markdown("1. Select your location and model.  \n2. Submit to get your crop pl
 with st.form("location_form"):
     state = st.selectbox("📍 Select State", INDIAN_STATES)
     village = st.text_input("🏡 Enter Village Name")
-    selected_model = st.selectbox("🧠 Choose Groq Model", GROQ_MODELS)
+    selected_model = st.selectbox(
+    "🧠 Choose Groq Model", 
+    GROQ_MODELS, 
+    index=GROQ_MODELS.index("meta-llama/llama-4-scout-17b-16e-instruct"))
+    
     submit = st.form_submit_button("🚀 Generate Crop Plan")
 
 # === On Submit ===
@@ -59,23 +62,27 @@ if submit:
         st.session_state.vectorstore = FAISS.from_documents(result["rag_docs"], embedding_model)
         st.session_state.retriever = st.session_state.vectorstore.as_retriever()
         st.session_state.smart_rag = RAGWithLLMFallback(llm, result["rag_docs"])
+        st.session_state.crop_plan_ready = True
 
         st.success("✅ Crop plan generated!")
 
-        with st.expander("📄 Crop Plan"):
-            st.markdown(result["crop_plan"])
+# === Display Crop Plan Section ===
+if st.session_state.get("crop_plan_ready"):
+    with st.expander("📄 Detailed Crop Plan", expanded=True):
+        st.markdown(st.session_state.original_crop_plan)
 
-        with st.expander("🌱 Crop Info"):
-            st.markdown(result["crop_info"])
+    with st.expander("🌱 Expert Crop Info"):
+        st.markdown(st.session_state.crop_info)
 
-        image_urls = extract_image_urls(result["crop_info"])
-        if image_urls:
-            st.markdown("### 🌾 Crop Images")
-            for url in image_urls:
-                st.image(url, width=250, caption="Crop")
+    # === Download Button ===
+    st.download_button(
+        label="📥 Download Crop Plan",
+        data=st.session_state.original_crop_plan + "\n\n" + st.session_state.crop_info,
+        file_name="AgriGuru_Crop_Plan.txt",
+        mime="text/plain"
+    )
 
-# === Chatbot Interface ===
-if "smart_rag" in st.session_state:
+    # === Chatbot Interface ===
     st.divider()
     st.markdown("## 🤖 Chat with AgriGuru")
 
