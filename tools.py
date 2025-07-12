@@ -142,7 +142,7 @@ def get_seasonal_weather_data(latitude: float, longitude: float) -> str:
             "start": start_date, "end": end_date
         }
         headers = {
-            "x-rapidapi-key": os.getenv("x-rapidapi-key"),
+            "x-rapidapi-key": os.getenv("RAPID_KEY"),
             "x-rapidapi-host": "meteostat.p.rapidapi.com"
         }
 
