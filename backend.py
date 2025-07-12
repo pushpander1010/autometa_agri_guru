@@ -186,3 +186,9 @@ Farmer's Feedback:
 Revise the crop plan accordingly. Keep it structured and useful.
 """
     return llm.invoke(prompt).content
+
+
+if __name__ == "__main__":
+    with open("crop_graph.dot", "w") as f:
+        f.write(crop_graph.get_graph().get_dot())
+    print("✅ DOT file saved as crop_graph.dot")
