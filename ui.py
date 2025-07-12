@@ -4,7 +4,7 @@ from langchain_community.vectorstores import FAISS
 from backend import (
     get_llm,
     GROQ_MODELS,
-    generate_crop_plan,
+    crop_graph,
     RAGWithLLMFallback,
     embedding_model
 )
@@ -39,29 +39,27 @@ with st.form("location_form"):
     state = st.selectbox("📍 Select State", INDIAN_STATES)
     village = st.text_input("🏡 Enter Village Name")
     selected_model = st.selectbox(
-    "🧠 Choose Groq Model", 
-    GROQ_MODELS, 
-    index=GROQ_MODELS.index("meta-llama/llama-4-scout-17b-16e-instruct"))
-    
+        "🧠 Choose Groq Model", 
+        GROQ_MODELS, 
+        index=GROQ_MODELS.index("meta-llama/llama-4-scout-17b-16e-instruct")
+    )
     submit = st.form_submit_button("🚀 Generate Crop Plan")
 
 # === On Submit ===
 if submit:
     with st.spinner("Generating personalized crop plan..."):
         llm = get_llm(selected_model)
-
-        # Construct location object
         location = get_state_coordinates.invoke(state)
 
-        result = generate_crop_plan(llm, location)
+        final_state = crop_graph.invoke({"location": location})
 
-        st.session_state.original_crop_plan = result["crop_plan"]
-        st.session_state.crop_info = result["crop_info"]
-        st.session_state.rag_docs = result["rag_docs"]
-        st.session_state.curr_loc = result["curr_loc"]
-        st.session_state.vectorstore = FAISS.from_documents(result["rag_docs"], embedding_model)
+        st.session_state.original_crop_plan = final_state["crop_plan"]
+        st.session_state.crop_info = final_state["crop_info"]
+        st.session_state.rag_docs = final_state["rag_docs"]
+        st.session_state.curr_loc = location
+        st.session_state.vectorstore = FAISS.from_documents(final_state["rag_docs"], embedding_model)
         st.session_state.retriever = st.session_state.vectorstore.as_retriever()
-        st.session_state.smart_rag = RAGWithLLMFallback(llm, result["rag_docs"])
+        st.session_state.smart_rag = RAGWithLLMFallback(final_state["rag_docs"])
         st.session_state.crop_plan_ready = True
 
         st.success("✅ Crop plan generated!")

@@ -1,25 +1,23 @@
-from langchain.agents import initialize_agent, AgentType
-from langchain_core.tools import tool
+from typing import List, Dict, TypedDict, Any
+from pydantic import BaseModel, Field
 from langchain_core.documents import Document
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.runnables import RunnableLambda
+from langgraph.graph import StateGraph, END
+from tools import (
+    get_weather_and_soil_data,
+    get_farm_prices,
+    get_soil_properties,
+    get_seasonal_weather_data
+)
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.output_parsers import PydanticOutputParser
-from pydantic import BaseModel, Field
-from langchain_community.vectorstores import FAISS
-from tools import (
-    get_state_coordinates,
-    get_soil_properties,
-    get_weather_and_soil_data,
-    get_seasonal_weather_data,
-    get_farm_prices
-)
 import os
 
-class CropListOutput(BaseModel):
-    crops: list[str] = Field(description="List of crop names mentioned in the crop plan.")
-
-
+# === Embeddings ===
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 # === Supported LLMs ===
 GROQ_MODELS = [
@@ -42,11 +40,7 @@ GROQ_MODELS = [
     "qwen/qwen3-32b"
 ]
 
-
-# === Embeddings ===
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-# === Helper: Get LLM ===
+# === LLM Initialization ===
 def get_llm(model_name: str = "meta-llama/llama-4-scout-17b-16e-instruct"):
     return ChatGroq(
         model=model_name,
@@ -54,77 +48,73 @@ def get_llm(model_name: str = "meta-llama/llama-4-scout-17b-16e-instruct"):
         api_key=os.getenv("GROQ_API_KEY")
     )
 
-# === LangChain Tools ===
-tool_list = [
-    get_state_coordinates,
-    get_soil_properties,
-    get_weather_and_soil_data,
-    get_seasonal_weather_data,
-    get_farm_prices
-]
+# === Pydantic output parser schema ===
+class CropListOutput(BaseModel):
+    crops: List[str] = Field(description="List of crop names")
 
-# === Agent Initialization ===
-def get_agent(llm):
-    return initialize_agent(
-        tools=tool_list,
-        llm=llm,
-        agent=AgentType.OPENAI_FUNCTIONS,
-        verbose=True,
-        handle_parsing_errors=True
-    )
+# === LangGraph state schema ===
+class CropPlanState(TypedDict, total=False):
+    location: Dict[str, Any]
+    weather_soil_summary: str
+    crop_plan: str
+    extracted_crops: List[str]
+    mandi_prices: str
+    soil_info_api: str
+    soil_info_llm: str
+    seasonal_weather: str
+    crop_info: str
+    rag_docs: List[Document]
 
-# === Crop Plan Generator ===
-def generate_crop_plan(llm, location: dict) -> dict:
-    region = location.get("state", "Punjab")
-    lat = location.get("latitude", 30.76)
-    lon = location.get("longitude", 75.85)
+llm = get_llm()
 
-    # 1. Weather and soil analysis
-    weather_and_soil = get_weather_and_soil_data.invoke({"latitude": lat, "longitude": lon})
-    crop_plan = llm.invoke(
-        f"""Based on this weather and soil summary:\n\n{weather_and_soil}\n\n
-        Suggest the best seasonal crops with water needs, temperature range, soil compatibility, etc."""
-    ).content
+# === Graph Nodes ===
+def get_weather_soil_node(state: CropPlanState) -> CropPlanState:
+    summary = get_weather_and_soil_data.invoke(state["location"])
+    return {**state, "weather_soil_summary": summary}
 
-    # 2. Soil and seasonal weather
-    soil_info_api = get_soil_properties.invoke({"latitude": lat, "longitude": lon})
-    soil_info_llm = llm.invoke(f"Give an expert soil summary for {region}").content
-    seasonal_weather = get_seasonal_weather_data.invoke({"latitude": lat, "longitude": lon})
+def generate_crop_plan_node(state: CropPlanState) -> CropPlanState:
+    prompt = f"""Based on this weather and soil summary:\n\n{state["weather_soil_summary"]}\n\n
+    Suggest the best seasonal crops with water needs, temperature range, soil compatibility, etc."""
+    plan = llm.invoke(prompt).content
+    return {**state, "crop_plan": plan}
 
-    # 3. Fetch mandi prices for popular crops
+def extract_crop_names_node(state: CropPlanState) -> CropPlanState:
     parser = PydanticOutputParser(pydantic_object=CropListOutput)
-
-    crop_extraction_prompt = f"""
+    prompt = f"""
 Here is a crop plan:
 
-{crop_plan}
+{state['crop_plan']}
 
 Extract only the names of the crops mentioned in this plan. 
 Return them as a list of strings in the format: {{ "crops": ["Wheat", "Rice", "Mustard"] }}
 """
+    parsed = parser.invoke(llm.invoke(prompt).content)
+    return {**state, "extracted_crops": parsed.crops}
 
-# Pass prompt through parser
-    parsed_output = parser.invoke(llm.invoke(crop_extraction_prompt).content)
-
-    crop_list = parsed_output.crops if parsed_output and parsed_output.crops else ["Wheat", "Rice", "Mustard"]
-
+def fetch_mandi_prices_node(state: CropPlanState) -> CropPlanState:
+    region = state["location"]["state"]
     mandi_data = []
-    for crop in crop_list:
+    for crop in state["extracted_crops"]:
         prices = get_farm_prices.invoke({"stateName": region, "commodity": crop})
         if "No mandi price" not in prices:
             mandi_data.append(prices)
+    summary = "\n\n".join(mandi_data) if mandi_data else "No recent mandi price data found for your region."
+    return {**state, "mandi_prices": summary}
 
-    mandi_summary = "\n\n".join(mandi_data) if mandi_data else "No recent mandi price data found for your region."
-
-    # 4. Crop-specific insights
-    crop_info = llm.invoke(f"""
+def enrich_crop_info_node(state: CropPlanState) -> CropPlanState:
+    lat, lon = state["location"]["latitude"], state["location"]["longitude"]
+    region = state["location"]["state"]
+    soil_api = get_soil_properties.invoke({"latitude": lat, "longitude": lon})
+    soil_llm = llm.invoke(f"Give expert soil summary for {region}").content
+    seasonal_weather = get_seasonal_weather_data.invoke({"latitude": lat, "longitude": lon})
+    full_prompt = f"""
 Crop Plan:
-{crop_plan}
+{state['crop_plan']}
 
-Location: {location}
-Soil Info: {soil_info_api} {soil_info_llm}
+Location: {state['location']}
+Soil Info: {soil_api} {soil_llm}
 Seasonal Weather: {seasonal_weather}
-Mandi Prices: {mandi_summary}
+Mandi Prices: {state['mandi_prices']}
 
 Now generate:
 - Common diseases & treatments
@@ -132,26 +122,60 @@ Now generate:
 - Growing instructions
 - Subsidies
 - public Image URLs
-""").content
-
-    # 5. RAG docs
-    docs = [
-        Document(page_content=crop_plan, metadata={"type": "plan"}),
-        Document(page_content=soil_info_llm, metadata={"type": "info"}),
-        Document(page_content=crop_info, metadata={"type": "info"}),
-        Document(page_content=weather_and_soil, metadata={"type": "summary"}),
-        Document(page_content=mandi_summary, metadata={"type": "prices"})
-    ]
-
+"""
+    crop_info = llm.invoke(full_prompt).content
     return {
-        "crop_plan": crop_plan,
-        "crop_info": crop_info,
-        "rag_docs": docs,
-        "curr_loc": location
+        **state,
+        "soil_info_api": soil_api,
+        "soil_info_llm": soil_llm,
+        "seasonal_weather": seasonal_weather,
+        "crop_info": crop_info
     }
 
-# === Feedback Loop ===
-def revise_crop_plan(llm, original_plan: str, feedback: str) -> str:
+def prepare_rag_docs_node(state: CropPlanState) -> CropPlanState:
+    docs = [
+        Document(page_content=state["crop_plan"], metadata={"type": "plan"}),
+        Document(page_content=state["soil_info_llm"], metadata={"type": "info"}),
+        Document(page_content=state["crop_info"], metadata={"type": "info"}),
+        Document(page_content=state["weather_soil_summary"], metadata={"type": "summary"}),
+        Document(page_content=state["mandi_prices"], metadata={"type": "prices"})
+    ]
+    return {**state, "rag_docs": docs}
+
+# === Assemble LangGraph ===
+graph = StateGraph(CropPlanState)
+graph.add_node("weather_soil", RunnableLambda(get_weather_soil_node))
+graph.add_node("generate_plan", RunnableLambda(generate_crop_plan_node))
+graph.add_node("extract_crops", RunnableLambda(extract_crop_names_node))
+graph.add_node("mandi_prices", RunnableLambda(fetch_mandi_prices_node))
+graph.add_node("enrich_info", RunnableLambda(enrich_crop_info_node))
+graph.add_node("prepare_docs", RunnableLambda(prepare_rag_docs_node))
+graph.set_entry_point("weather_soil")
+graph.add_edge("weather_soil", "generate_plan")
+graph.add_edge("generate_plan", "extract_crops")
+graph.add_edge("extract_crops", "mandi_prices")
+graph.add_edge("mandi_prices", "enrich_info")
+graph.add_edge("enrich_info", "prepare_docs")
+graph.add_edge("prepare_docs", END)
+crop_graph = graph.compile()
+
+# === Optional: RAG fallback class ===
+class RAGWithLLMFallback:
+    def __init__(self, documents: List[Document]):
+        self.vectorstore = FAISS.from_documents(documents, embedding_model)
+        self.retriever = self.vectorstore.as_retriever()
+        self.qa = RetrievalQA.from_chain_type(llm=llm, retriever=self.retriever)
+    def invoke(self, query: str) -> str:
+        try:
+            result = self.qa.invoke({"query": query})
+            if not result.get("result") or "i don't know" in result.get("result", "").lower():
+                raise ValueError("RAG fallback")
+            return result["result"]
+        except Exception:
+            return llm.invoke(f"Answer this farming query directly:\n{query}").content
+
+# === Feedback-based revision ===
+def revise_crop_plan(original_plan: str, feedback: str) -> str:
     prompt = f"""
 Original Crop Plan:
 {original_plan}
@@ -162,20 +186,3 @@ Farmer's Feedback:
 Revise the crop plan accordingly. Keep it structured and useful.
 """
     return llm.invoke(prompt).content
-
-# === RAG with LLM Fallback ===
-class RAGWithLLMFallback:
-    def __init__(self, llm, documents):
-        self.llm = llm
-        self.vectorstore = FAISS.from_documents(documents, embedding_model)
-        self.retriever = self.vectorstore.as_retriever()
-        self.qa = RetrievalQA.from_chain_type(llm=llm, retriever=self.retriever)
-
-    def invoke(self, query: str) -> str:
-        try:
-            result = self.qa.invoke({"query": query})
-            if not result.get("result") or "i don't know" in result.get("result", "").lower():
-                raise ValueError("RAG fallback")
-            return result["result"]
-        except Exception:
-            return self.llm.invoke(f"Answer this farming query directly:\n{query}").content
